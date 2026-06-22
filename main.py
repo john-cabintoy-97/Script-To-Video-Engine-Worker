@@ -125,14 +125,30 @@ def update_job(video_id: str, **fields: Any) -> None:
 
 def clean_script_text(raw_script: str) -> str:
     """Removes production metadata, timestamps, and formatting cues from the narration."""
-    # Strip timestamp patterns like '00:00', '1:23', or ranges like '00:02 to 00:10'
-    text = re.sub(r'\b\d{1,2}:\d{2}(?:\s*to\s*\d{1,2}:\d{2})?\b', '', raw_script)
-    # Strip production bracket layout configurations: [Visual: ...] or (SFX: ...)
+    # 1. Drop entire lines that describe visuals or production steps completely
+    # This prevents the visual text description from being blended into the voiceover text
+    lines = raw_script.splitlines()
+    filtered_lines = []
+    
+    for line in lines:
+        # If the line is purely visual or technical notes, skip it completely
+        if re.search(r'(?i)^\s*(?:visual|sfx|audio|scene\s*\d*)\b', line):
+            continue
+        filtered_lines.append(line)
+        
+    text = "\n".join(filtered_lines)
+
+    # 2. Strip timestamp patterns like '00:00', '1:23', or ranges like '00:02 to 00:10'
+    text = re.sub(r'\b\d{1,2}:\d{2}(?:\s*to\s*\d{1,2}:\d{2})?\b', '', text)
+    
+    # 3. Strip structural layout bracket settings: [Visual: ...] or (SFX: ...)
     text = re.sub(r'\[[^\]]*\]', '', text)
     text = re.sub(r'\([^)]*\)', '', text)
-    # Clear line prefixes like "Hook:", "Visual:", "Audio:", "Narration:", "Script:"
-    text = re.sub(r'(?i)^\s*(?:hook|visual|audio|narration|script|sfx|voiceover|scene\s*\d*)\s*:\s*', '', text, flags=re.MULTILINE)
-    # Normalize structural spacing anomalies
+    
+    # 4. Clear inline narration prefixes like "Narration:", "Hook:", "Script:"
+    text = re.sub(r'(?i)^\s*(?:hook|narration|script|voiceover)\s*:\s*', '', text, flags=re.MULTILINE)
+    
+    # 5. Normalize whitespace down to clean prose sentences
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
