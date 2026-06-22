@@ -532,7 +532,12 @@ def compile_video_with_ffmpeg(
         trimmed_clips.append(trimmed)
 
     concat_list_path = job_dir / "concat_list.txt"
-    lines = [f"file '{str(clip.resolve()).replace('\\', '/')}'" for clip in trimmed_clips]
+    lines = []
+    for clip in trimmed_clips:
+        # 1. Clean up the backslashes outside the f-string
+        safe_path = str(clip.resolve()).replace('\\', '/')
+        # 2. Inject the safe path cleanly
+        lines.append(f"file '{safe_path}'")
     concat_list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     concatenated_path = job_dir / "concatenated.mp4"
