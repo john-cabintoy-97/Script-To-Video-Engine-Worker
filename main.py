@@ -120,6 +120,24 @@ def update_job(video_id: str, **fields: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Script Sanitizer Utility
+# ---------------------------------------------------------------------------
+
+def clean_script_text(raw_script: str) -> str:
+    """Removes production metadata, timestamps, and formatting cues from the narration."""
+    # Strip timestamp patterns like '00:00', '1:23', or ranges like '00:02 to 00:10'
+    text = re.sub(r'\b\d{1,2}:\d{2}(?:\s*to\s*\d{1,2}:\d{2})?\b', '', raw_script)
+    # Strip production bracket layout configurations: [Visual: ...] or (SFX: ...)
+    text = re.sub(r'\[[^\]]*\]', '', text)
+    text = re.sub(r'\([^)]*\)', '', text)
+    # Clear line prefixes like "Hook:", "Visual:", "Audio:", "Narration:", "Script:"
+    text = re.sub(r'(?i)^\s*(?:hook|visual|audio|narration|script|sfx|voiceover|scene\s*\d*)\s*:\s*', '', text, flags=re.MULTILINE)
+    # Normalize structural spacing anomalies
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Pydantic schemas
 # ---------------------------------------------------------------------------
 
@@ -279,13 +297,16 @@ async def run_video_pipeline(
     job_dir: Path,
 ) -> None:
     try:
+        update_job(video_id, step="Sanitizing metadata noise from script...", progress=2)
+        clean_script = clean_script_text(script)
+
         update_job(video_id, step="Parsing script hooks with Gemini...", progress=5)
-        segments = await parse_script_with_gemini(script)
+        segments = await parse_script_with_gemini(clean_script)
         save_json(job_dir / "segments.json", {"segments": [s.model_dump() for s in segments]})
 
         update_job(video_id, step="Compiling voice over via ElevenLabs...", progress=20)
         voiceover_path = job_dir / "voiceover.mp3"
-        await generate_voiceover_elevenlabs(script, voiceover_path, voice_profile)
+        await generate_voiceover_elevenlabs(clean_script, voiceover_path, voice_profile)
 
         update_job(video_id, step="Sourcing b-roll media...", progress=35)
         clip_paths = await run_in_threadpool(
