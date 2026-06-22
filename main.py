@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import uuid
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -47,7 +48,17 @@ logger = logging.getLogger("script-to-video-worker")
 WORK_DIR = Path(os.getenv("WORK_DIR", "workspace")).resolve()
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-OUTPUT_BASE_URL = os.getenv("OUTPUT_BASE_URL", "http://localhost:7860/outputs").rstrip("/")
+RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+
+if RAILWAY_DOMAIN:
+    # Remove any pre-existing protocol or trailing slashes to normalize
+    clean_domain = RAILWAY_DOMAIN.replace("http://", "").replace("https://", "").strip("/")
+    # Construct a guaranteed absolute HTTPS address with standard routing
+    OUTPUT_BASE_URL = f"https://{clean_domain}/outputs"
+else:
+    # Fall back to custom variable or localhost if running locally
+    OUTPUT_BASE_URL = os.getenv("OUTPUT_BASE_URL", "http://localhost:7860/outputs").rstrip("/")
+    
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
@@ -78,7 +89,7 @@ if GEMINI_API_KEY:
 JobStatus = Literal["processing", "completed", "failed"]
 
 # ---------------------------------------------------------------------------
-# In-memory job store
+# In-memory job store & persistence helpers
 # ---------------------------------------------------------------------------
 
 jobs_db: dict[str, dict[str, Any]] = {}
@@ -88,12 +99,24 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def save_json(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
 def update_job(video_id: str, **fields: Any) -> None:
-    """Merge fields into an existing job record."""
+    """Merge fields into an existing job record and mirror to disk."""
     if video_id not in jobs_db:
         return
     jobs_db[video_id].update(fields)
     jobs_db[video_id]["updated_at"] = utc_now_iso()
+    
+    # Save a persistent state recovery checkpoint inside the workspace directory
+    try:
+        job_dir = Path(jobs_db[video_id]["job_dir"])
+        if job_dir.exists():
+            save_json(job_dir / "job_status.json", jobs_db[video_id])
+    except Exception as e:
+        logger.warning(f"Failed to persist state checkpoint for job {video_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +209,9 @@ async def generate_video(
         "job_dir": str(job_dir),
     }
 
+    # Save initial configuration payload to disk layout
+    save_json(job_dir / "job_status.json", jobs_db[video_id])
+
     background_tasks.add_task(
         run_video_pipeline,
         video_id=video_id,
@@ -202,6 +228,18 @@ async def generate_video(
 async def get_job_status(video_id: str) -> StatusResponse:
     """Return live progress, step message, and final URL when complete."""
     job = jobs_db.get(video_id)
+    
+    # Context recovery logic if memory was wiped via container replacement cycles
+    if not job:
+        try:
+            fallback_path = WORK_DIR / video_id / "job_status.json"
+            if fallback_path.exists():
+                job = json.loads(fallback_path.read_text(encoding="utf-8"))
+                jobs_db[video_id] = job  # Hydrate cache mapping
+                logger.info(f"Successfully re-hydrated job profile {video_id} from storage fallback.")
+        except Exception as e:
+            logger.error(f"Error reading status fallback for job {video_id}: {e}")
+
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{video_id}' not found.")
 
@@ -518,9 +556,12 @@ def compile_video_with_ffmpeg(
     for segment, source_clip in zip(segments, clip_paths, strict=True):
         trimmed = job_dir / f"trimmed_{segment.segment_id:03d}.mp4"
         
+        # Fixed duration bug: "-stream_loop -1" forces assets to loop seamlessly if shorter than target text window
         subprocess.run(
             [
-                FFMPEG_BINARY_PATH, "-y", "-i", str(source_clip),
+                FFMPEG_BINARY_PATH, "-y", 
+                "-stream_loop", "-1",
+                "-i", str(source_clip),
                 "-t", f"{segment_duration:.2f}", "-an",
                 "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
                 "-c:v", "libx264", "-preset", "ultrafast",
@@ -534,9 +575,7 @@ def compile_video_with_ffmpeg(
     concat_list_path = job_dir / "concat_list.txt"
     lines = []
     for clip in trimmed_clips:
-        # 1. Clean up the backslashes outside the f-string
         safe_path = str(clip.resolve()).replace('\\', '/')
-        # 2. Inject the safe path cleanly
         lines.append(f"file '{safe_path}'")
     concat_list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -571,12 +610,15 @@ def compile_video_with_ffmpeg(
         entries.append(f"{segment.segment_id}\n{format_srt_time(start)} --> {format_srt_time(end)}\n{segment.narration_text.strip()}\n")
     subtitles_path.write_text("\n".join(entries), encoding="utf-8")
 
-    # Writes directly to the static mount to bypass sharing violations entirely
     final_path = (WORK_DIR / video_id / "final.mp4").resolve()
     final_path.parent.mkdir(parents=True, exist_ok=True)
     
-    safe_sub_path = str(subtitles_path.resolve()).replace('\\', '/')
-    safe_sub_path = safe_sub_path.replace(':', '\\:')
+    # OS-Safe filter formatting to accommodate Windows local tests and Railway Linux environments smoothly
+    if sys.platform == "win32":
+        safe_sub_path = str(subtitles_path.resolve()).replace('\\', '/').replace(':', '\\:')
+    else:
+        safe_sub_path = str(subtitles_path.resolve())
+        
     sub_filter = f"subtitles='{safe_sub_path}'"
     
     subprocess.run(
@@ -630,10 +672,6 @@ async def upload_to_cloud_mock(local_path: Path, video_id: str) -> str:
 
     logger.info(f"Asset verified at static distribution layout. Size: {local_path.stat().st_size} bytes.")
     return f"{OUTPUT_BASE_URL}/{video_id}/final.mp4"
-
-
-def save_json(path: Path, data: Any) -> None:
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
